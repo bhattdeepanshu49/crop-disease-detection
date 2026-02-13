@@ -6,6 +6,8 @@ IMG_SIZE = (224, 224)
 NUM_CLASSES = 39
 EPOCHS = 10
 
+
+
 train_ds = tf.keras.utils.image_dataset_from_directory(
     "train",
     image_size=IMG_SIZE,
