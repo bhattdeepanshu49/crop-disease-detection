@@ -1,81 +1,95 @@
 from imports import *
 from data import *
 
-class Model(pl.LightningModule):
-    def __init__(self):
-        super().__init__()
-        self.model = models.resnet18(num_classes=39)
-        self.accuracy = tm.Accuracy()
-        self.loss_func = nn.CrossEntropyLoss()
+BATCH_SIZE = 64
+IMG_SIZE = (224, 224)
+NUM_CLASSES = 39
+EPOCHS = 10
 
-    def forward(self, x):
-        out = self.model(x)
-        return out
-        
-    def training_step(self, batch, batch_idx):
-        data, label = batch
-        out = self(data)
-        acc = self.accuracy(out, label)
-        loss = self.loss_func(out, label)
-        self.log('Loss/train', loss)
-        self.log('Accuracy/train', acc)
-        return loss
+train_ds = tf.keras.utils.image_dataset_from_directory(
+    "train",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
 
-    def validation_step(self, batch, batch_idx):
-        data, label = batch
-        out = self(data)
-        acc = self.accuracy(out, label)
-        loss = self.loss_func(out, label)
-        self.log('Loss/val', loss)
-        self.log('Accuracy/val', acc)
-        return loss
+val_ds = tf.keras.utils.image_dataset_from_directory(
+    "val",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE
+)
 
-    def predict_step(self, batch, batch_idx):
-        data, label = batch
-        out = self(data)
-        _, idx = torch.max(out, dim=1)
-        return idx
+test_ds = tf.keras.utils.image_dataset_from_directory(
+    "test",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE
+)
 
-    def test_step(self, batch, batch_idx):
-        data, label = batch
-        out = self(data)
-        acc = self.accuracy(out, label)
-        loss = self.loss_func(out, label)
-        self.log('Loss/test', loss)
-        self.log('Accuracy/test', acc)
-        return loss
+normalization_layer = layers.Rescaling(1./255)
 
-    def configure_optimizers(self):
-        optimizer = optim.SGD(self.parameters(), lr=3e-3, weight_decay=0) # wd = 3e-3
-        steps_per_epoch = math.ceil(len(train_ds)/64)
-        scheduler = {
-            "scheduler": optim.lr_scheduler.OneCycleLR(optimizer, 
-                                                       max_lr=1e-2, epochs=10, 
-                                                       steps_per_epoch=steps_per_epoch),
-            "interval": "step",
-            "frequency": 1,
-        }
+train_ds = train_ds.map(lambda x, y: (normalization_layer(x), y))
+val_ds = val_ds.map(lambda x, y: (normalization_layer(x), y))
+test_ds = test_ds.map(lambda x, y: (normalization_layer(x), y))
 
-        return [optimizer], [scheduler]
 
-    def train_dataloader(self):
-        train_dl = torch.utils.data.DataLoader(train_ds, shuffle=True, batch_size=64, num_workers=2)
-        return train_dl
 
-    def val_dataloader(self):
-        val_dl = torch.utils.data.DataLoader(val_ds, batch_size=64, num_workers=2)
-        return val_dl
+base_model = tf.keras.applications.ResNet50(
+    include_top=False,
+    weights="imagenet",
+    input_shape=(224, 224, 3)
+)
 
-    def test_dataloader(self):
-        test_dl = torch.utils.data.DataLoader(test_ds, batch_size=64, num_workers=2)
-        return test_dl
+base_model.trainable = False  # Freeze for transfer learning
 
-model = Model()
+inputs = keras.Input(shape=(224, 224, 3))
+x = base_model(inputs, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(512, activation="relu")(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
 
-logger = pl.loggers.TensorBoardLogger('lightning_logs', name='baseline-resnet18')
-trainer = pl.Trainer(gpus=1, logger=logger, 
-                     max_epochs=10, profiler='simple',
-                     callbacks=[ModelCheckpoint(save_weights_only=True, mode="min", monitor="Loss/val"),
-                                LearningRateMonitor("step")])
+model = keras.Model(inputs, outputs)
 
-trainer.fit(model)
+
+
+model.compile(
+    optimizer=tf.keras.optimizers.SGD(learning_rate=3e-3),
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+    metrics=["accuracy"]
+)
+
+
+steps_per_epoch = math.ceil(len(train_ds))
+
+lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
+    initial_learning_rate=3e-3,
+    decay_steps=steps_per_epoch * EPOCHS,
+    end_learning_rate=1e-5
+)
+
+model.optimizer.learning_rate = lr_schedule
+
+
+
+checkpoint_cb = keras.callbacks.ModelCheckpoint(
+    "best_model.h5",
+    save_best_only=True,
+    monitor="val_loss",
+    mode="min"
+)
+
+tensorboard_cb = keras.callbacks.TensorBoard(log_dir="logs")
+
+
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[checkpoint_cb, tensorboard_cb]
+)
+
+
+
+test_loss, test_acc = model.evaluate(test_ds)
+print("Test Accuracy:", test_acc)
